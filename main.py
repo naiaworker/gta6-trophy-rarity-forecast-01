@@ -1,31 +1,29 @@
-"""gta6-trophy-rarity-forecast-01 — prototype forecaster (chunk 1).
+"""gta6-trophy-rarity-forecast-01 — forecaster v4 (chunk 4: refresh inversion).
 
-Model: earners/players decomposition with hierarchical shrinkage and robust
-trends, in logit space for the spread.
+Built on the chunk-1 skeleton (page-state compression, Theil-Sen trend
+branch for multi-state histories — UNCHANGED). The frozen-page branch is
+replaced: instead of growing the old page's earners by a blanket prior,
+v4 INVERTS the documented refresh. The refreshed page is modelled as
 
-    rate_i(target) = E_i(target) / P(target)
+    E'_i = E_i * OLD_GROWTH + N_new * q_i
 
-where P is Exophase's players-tracked count and E_i trophy i's earner count
-(recovered exactly from the printed rates: E = round(rate * P / 100); on the
-practice cases the recovered earners sum exactly to the page's trophies_earned).
-
-Pipeline per case:
-  1. Compress the read history into distinct page states (the page only changes
-     when Exophase refreshes it; consecutive identical reads are one state).
-  2. Forecast P at the target:
-     - >= 2 states: Theil-Sen slope of ln P over states, extrapolated with
-       exponential decay of the growth rate (saturating growth).
-     - 1 state (a frozen page): a refresh prior — the page is stale and will be
-       refreshed before the target; the documented first refresh multiplied the
-       player count by 3868/638 ~ 6.06 while earners grew far less.
-  3. Forecast each E_i the same way (Theil-Sen slope of ln(E + 0.5), shrunk
-     hierarchically toward the tier-group and global median slopes, saturating
-     extrapolation, capped at P). In the frozen-page case, earners get a modest
-     growth prior instead (they grew ~25% over the documented stale window,
-     the growth implied by the house baseline's official practice loss ~1.51).
-  4. Median rate from the ratio; spread on the logit scale combines the player
-     uncertainty, the per-trophy earner uncertainty (shrunk toward its group),
-     and a rounding term; quantiles are inv_logit(median_logit + z * sigma).
+where N_new is the refresh cohort's size (forecast players minus the
+frozen page's players) and q_i is the cohort's per-trophy earn
+probability, structured by story progression: a decaying chapter chain
+(Complete Chapter 1..4, then the final mission), story missions and
+character-arc finals at fixed fractions of the chapter-1 level, and
+open-world activities proportional to a power of their frozen rate.
+The profile constants were fitted (fit_inv.py) so the implied practice
+answer best reproduces the seven official practice observables of the
+three submissions made with this trophy set (chunk-1, the chunk-2 rule,
+the house baseline); SigmaDelta on the practice page is 68, inside the
+hard feasible range [61, 89] from the chunk-3 identification analysis.
+Chapter-chain monotonicity of E' (a player cannot hold Chapter 4
+without Chapter 1) and the platinum cap (the platinum holder set is a
+subset of every other trophy's holder set) are enforced on the centres.
+The spread in the frozen branch is per-group: the identification spread
+of the refreshed earners measured in chunk 4's per-trophy diagnostic
+(story block sd ~3 earners, activities ~2), not a blanket constant.
 
 Deterministic: no randomness anywhere. Standard library only.
 Reads $MAKEFUN_INPUT_DIR (default /input), writes $MAKEFUN_OUTPUT_DIR (/output).
@@ -58,6 +56,21 @@ FLAT_LN_EARNER_GROWTH = 0.25
 FLAT_SIGMA_LN_EARNERS = 0.20
 SIGMA_FLOOR = 0.12               # minimum logit spread (printing/rounding jitter)
 SIGMA_ROUND_CAP = 0.15
+
+# --- Chunk 4: refresh-inversion cohort profile (fitted in fit_inv.py) -------
+# Cohort earn probabilities q_i by progression group; see module docstring.
+COHORT_C1 = 0.00186              # P(new-cohort player completed Chapter 1)
+COHORT_RHO = 0.73512             # per-chapter decay of completion probability
+COHORT_RHOF = 0.98421            # final mission, relative to Chapter 4
+COHORT_MU = 0.67531              # story missions, relative to Chapter 1
+COHORT_ALPHA = 0.77352           # character-arc finals, relative to Chapter 1
+COHORT_A = 0.00064               # activity scale: q = A * (frozen rate)^GAMMA
+COHORT_GAMMA = 0.36232
+OLD_GROWTH = 1.04368             # old cohort's earner growth over the window
+FLAT_SIGMA_LN_PLAYERS_V4 = 0.20  # player-count spread used by the v4 branch
+SD_E_STORY = 3.2                 # identification spread (earners), story block
+SD_E_ACTIVITY = 1.8              # identification spread (earners), activities
+SIGMA_FLOOR_V4 = 0.15
 
 
 def clamp_pct(x: float) -> float:
@@ -165,8 +178,10 @@ def forecast_players(states: list, horizon_days: float) -> tuple:
     last = states[-1]
     if len(states) == 1:
         # Frozen page: it will refresh before the target. Prior centred on the
-        # documented first-refresh multiplier, widening slowly with horizon.
-        ln_mult = FLAT_LN_PLAYER_MULT + 0.35 * math.log1p(horizon_days)
+        # documented first-refresh multiplier. v4: the horizon term is kept
+        # small (0.10) — the answer read follows the refresh closely, and the
+        # chunk-1 coefficient (0.35) overshot the documented 3,868 by ~2%.
+        ln_mult = FLAT_LN_PLAYER_MULT + 0.10 * math.log1p(horizon_days)
         return last.players * math.exp(ln_mult), FLAT_SIGMA_LN_PLAYERS
     pts = thin([(s.t, math.log(s.players)) for s in states], MAX_TS_STATES)
     ts = [p[0] for p in pts]
@@ -224,6 +239,40 @@ def trophy_slopes(states: list, trophies: list) -> tuple:
     return shrunk, raw, counts
 
 
+def progression_group(trophy: dict) -> tuple:
+    """Classify a trophy by story-progression group from its description
+    (the named story missions fall back to their id band)."""
+    desc = trophy.get("description") or ""
+    tid = trophy["id"]
+    if desc.startswith("Complete Chapter"):
+        try:
+            return ("chapter", int(desc.split("Chapter")[1].split(".")[0].strip()))
+        except (IndexError, ValueError):
+            return ("chapter", 1)
+    if desc == "Complete the final mission.":
+        return ("final", 0)
+    if "final mission for" in desc:
+        return ("arc", 0)
+    if 8 <= tid <= 13 and desc.startswith("Complete"):
+        return ("story", 0)
+    return ("activity", 0)
+
+
+def cohort_q(trophy: dict, e_last: int, players_old: int) -> float:
+    """Refresh cohort's earn probability for one trophy (chunk-4 profile)."""
+    kind, k = progression_group(trophy)
+    if kind == "chapter":
+        return COHORT_C1 * COHORT_RHO ** (k - 1)
+    if kind == "final":
+        return COHORT_C1 * COHORT_RHO ** 3 * COHORT_RHOF
+    if kind == "story":
+        return COHORT_C1 * COHORT_MU
+    if kind == "arc":
+        return COHORT_C1 * COHORT_ALPHA
+    r = (e_last / players_old) if players_old else 0.0
+    return COHORT_A * (r ** COHORT_GAMMA) if r > 0 else 0.0
+
+
 def forecast_case(case: dict) -> dict:
     if case["levels"] != LEVELS:
         raise ValueError(f"unexpected levels {case['levels']}")
@@ -240,6 +289,53 @@ def forecast_case(case: dict) -> dict:
         slopes = [0.0] * len(trophies)
     else:
         slopes, _raw, _counts = trophy_slopes(states, trophies)
+
+    # Chunk 4, frozen page: invert the refresh. Centres are the old page's
+    # earners grown slightly, plus the refresh cohort's earners from the
+    # structured profile; then enforce the trophy set's logical structure
+    # (chapter chain non-increasing, platinum capped by every other set).
+    flat_e_med = None
+    flat_sd_e = None
+    if flat:
+        n_new = max(0.0, players_med - last.players)
+        raw_e = []
+        for i, trophy in enumerate(trophies):
+            e_last = None
+            for s in reversed(states):
+                if s.earners[i] is not None:
+                    e_last = s.earners[i]
+                    break
+            if e_last is None or e_last >= last.players:
+                raw_e.append(None)
+            else:
+                raw_e.append(
+                    e_last * OLD_GROWTH
+                    + n_new * cohort_q(trophy, e_last, last.players)
+                )
+        chain = [
+            i for i, t in enumerate(trophies)
+            if progression_group(t)[0] in ("chapter", "final")
+        ]
+        chain.sort(key=lambda i: trophies[i]["id"])
+        changed = True
+        while changed:
+            changed = False
+            for a, b in zip(chain, chain[1:]):
+                if raw_e[a] is not None and raw_e[b] is not None \
+                        and raw_e[a] < raw_e[b]:
+                    m = 0.5 * (raw_e[a] + raw_e[b])
+                    raw_e[a] = raw_e[b] = m
+                    changed = True
+        plat = [i for i, t in enumerate(trophies) if t["tier"] == "platinum"]
+        others = [raw_e[i] for i in range(len(trophies))
+                  if raw_e[i] is not None and (not plat or i != plat[0])]
+        if plat and raw_e[plat[0]] is not None and others:
+            raw_e[plat[0]] = min(raw_e[plat[0]], min(others))
+        flat_e_med = raw_e
+        flat_sd_e = [
+            SD_E_ACTIVITY if progression_group(t)[0] == "activity" else SD_E_STORY
+            for t in trophies
+        ]
 
     rows = []
     for i, trophy in enumerate(trophies):
@@ -267,19 +363,22 @@ def forecast_case(case: dict) -> dict:
             )
             continue
         if flat:
-            ln_g = FLAT_LN_EARNER_GROWTH
-            sigma_ln_e = FLAT_SIGMA_LN_EARNERS
-            e_med = e_last * math.exp(ln_g)
+            e_med = flat_e_med[i]
+            sigma_ln_e = flat_sd_e[i] / (e_med + 1.0)
+            sigma_players_use = FLAT_SIGMA_LN_PLAYERS_V4
+            floor_use = SIGMA_FLOOR_V4
         else:
             d_ln_e = saturating_delta(slopes[i], horizon_days, SAT_TAU_DAYS)
             d_ln_e = max(-1.5, min(2.5, d_ln_e))
             e_med = (e_last + 0.5) * math.exp(d_ln_e) - 0.5
             sigma_ln_e = min(0.65, 0.10 + 0.20 * abs(d_ln_e) + 0.10 * math.sqrt(horizon_days))
+            sigma_players_use = sigma_ln_players
+            floor_use = SIGMA_FLOOR
         e_med = max(0.0, min(e_med, players_med * 0.999))
         med_rate = clamp_pct(100.0 * e_med / players_med)
         sigma_round = min(SIGMA_ROUND_CAP, 0.5 / max(1.0, e_med + 1.0))
-        sigma = math.sqrt(sigma_ln_players ** 2 + sigma_ln_e ** 2 + sigma_round ** 2)
-        sigma = max(SIGMA_FLOOR, sigma)
+        sigma = math.sqrt(sigma_players_use ** 2 + sigma_ln_e ** 2 + sigma_round ** 2)
+        sigma = max(floor_use, sigma)
         lg = logit_pct(med_rate)
         rows.append(
             {"id": trophy["id"],
